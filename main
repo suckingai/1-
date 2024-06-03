@@ -1,0 +1,485 @@
+import os
+import re
+import json
+import logging
+import sys
+from collections import Counter
+from transformers import AutoTokenizer
+from sklearn.model_selection import train_test_split
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QLineEdit, QLabel, QMessageBox, QProgressBar, QTabWidget)
+from PyQt5.QtCore import Qt
+
+# 로깅 설정
+logging.basicConfig(filename='preprocessor.log', level=logging.ERROR, format='%(asctime)s %(message)s')
+
+SETTINGS_FILE = 'settings.json'
+MODEL_DIR = os.path.join(os.path.expanduser("~"), ".kogpt2")
+PROPER_NOUNS = set()
+
+ALPACA_TEMPLATE = {
+    "instruction": "",
+    "input": "",
+    "output": ""
+}
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(settings, f, ensure_ascii=False, indent=4)
+
+def clean_text(text, custom_pattern=None):
+    text = re.sub(r"[^ㄱ-ㅎ가-힣\s]", "", text).lower()
+    if custom_pattern:
+        text = re.sub(custom_pattern, "", text)
+    return text
+
+def tokenize_text(text, model_dir):
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    except Exception as e:
+        logging.error("Error loading AutoTokenizer", exc_info=True)
+        raise e
+    tokens = tokenizer.tokenize(text)
+    return tokens
+
+def create_vocab(tokens):
+    return {word: idx for idx, (word, _) in enumerate(Counter(tokens).items(), start=1)}
+
+def load_proper_nouns(filepath):
+    global PROPER_NOUNS
+    try:
+        with open(filepath, 'r', encoding='utf-8') as file:
+            proper_nouns = json.load(file)
+        PROPER_NOUNS = set(proper_nouns)
+        QMessageBox.information(None, 'Success', '고유명사 사전이 성공적으로 로드되었습니다.')
+    except Exception as e:
+        QMessageBox.critical(None, 'Error', f'고유명사 사전 로드 중 오류가 발생했습니다: {str(e)}')
+
+def is_proper_noun(word):
+    return word in PROPER_NOUNS
+
+def extract_proper_nouns(texts):
+    proper_nouns = set()
+    pattern = re.compile(r'\b[A-Z][a-z]*|[가-힣]+\b')
+    stopwords = {
+        '그리고', '그러나', '그래서', '또는', '그렇지만', '따라서', '하지만', '그럼에도', '또한', '즉', '그런데',
+        '때문에', '그러므로', '그러니까', '뿐만 아니라', '만약', '이와 같은', '위해', '및', '중', '대해', '대한',
+        '통해', '속', '다른', '어떤', '모든', '각', '각각', '하는', '한', '이', '그', '저', '것', '수', '등',
+        '등등', '로서', '부터', '까지', '처럼', '같은', '때', '곳', '자', '그녀', '그들', '그것', '이것', '저것',
+        '누구', '무엇', '어디', '언제', '어떻게', '왜', '그래서', '때문에', '그러므로', '게다가', '결국', '하지만',
+        '그렇지만', '따라서', '또한', '혹은', '그리고', '그러나', '그런데', '즉', '그러면', '그러니까', '요컨대',
+        '그래도', '아니라', '일뿐', '게다가', '더구나', '그러면', '그래도', '도', '에서', '으로', '와', '과', '의',
+        '를', '을', '가', '이', '에', '게', '까지', '부터', '에', '까지', '에게', '한테', '밖에', '대로', '처럼',
+        'and', 'or', 'but', 'so', 'because', 'however', 'therefore', 'thus', 'although', 'though',
+        'moreover', 'furthermore', 'meanwhile', 'otherwise', 'instead', 'hence', 'nevertheless',
+        'nonetheless', 'since', 'whereas', 'while', 'if', 'unless', 'until', 'before', 'after',
+        'once', 'when', 'whenever', 'wherever', 'whether', 'throughout', 'despite', 'during',
+        'including', 'among', 'besides', 'without', 'within', 'outside', 'toward', 'against', 'among',
+        'between', 'behind', 'under', 'above', 'over', 'below', 'near', 'by', 'next', 'to', 'from', 'with', 'of', 'in', 'on', 'at', 'about', 'as', 'for'
+    }
+    
+    for text in texts:
+        words = pattern.findall(text)
+        for word in words:
+            if (word[0].isupper() or word[0] >= '가' and word[0] <= '힣') and word.lower() not in stopwords:
+                proper_nouns.add(word)
+    
+    return list(proper_nouns)
+
+def analyze_proper_nouns(data_paths, model_dir, min_freq=5):
+    global PROPER_NOUNS
+    merged_text = ''
+    for data_path in data_paths:
+        with open(data_path, 'r', encoding='utf-8') as f:
+            merged_text += f.read() + "\n"
+    
+    cleaned_text = clean_text(merged_text)
+    tokens = tokenize_text(cleaned_text, model_dir)
+    token_counts = Counter(tokens)
+
+    frequent_tokens = {token for token, count in token_counts.items() if count >= min_freq and is_proper_noun(token)}
+    PROPER_NOUNS.update(frequent_tokens)
+
+def create_qa_pairs(tokens, window_size=5, max_pairs=100, template=None):
+    if template is None:
+        template = ALPACA_TEMPLATE.copy()
+    
+    qa_pairs = []
+    for i in range(len(tokens) - window_size):
+        context = tokens[i:i + window_size]
+        target = tokens[i + window_size]
+        if not is_proper_noun(target):
+            continue
+        context_str = ' '.join(context)
+
+        qa_pairs.append({
+            "instruction": template["instruction"].format(context_str=context_str, target=target),
+            "input": template["input"],
+            "output": template["output"].format(context_str=context_str, target=target)
+        })
+        
+        if len(qa_pairs) >= max_pairs:
+            break
+
+    return qa_pairs
+
+def create_dpo_pairs(tokens, window_size=5):
+    dpo_pairs = []
+    for i in range(len(tokens) - window_size):
+        context = tokens[i:i + window_size]
+        target = tokens[i + window_size]
+        context_str = ' '.join(context)
+        
+        dpo_pairs.append({
+            "instruction": context_str,
+            "input": "",
+            "output": target
+        })
+    
+    return dpo_pairs
+
+def ensure_unique_filename(base_path, filename):
+    counter = 1
+    name, ext = os.path.splitext(filename)
+    unique_filename = filename
+    while os.path.exists(os.path.join(base_path, unique_filename)):
+        unique_filename = f"{name}_{counter}{ext}"
+        counter += 1
+    return unique_filename
+
+def process_data(data_paths, output_dir, batch_size, model_dir, custom_pattern=None, test_size=0.2, progress_callback=None, max_pairs=100, template_path=None):
+    try:
+        if template_path:
+            with open(template_path, 'r', encoding='utf-8') as f:
+                template = json.load(f)
+        else:
+            template = ALPACA_TEMPLATE
+        
+        merged_text = ''
+        total_steps = len(data_paths) + 4
+        current_step = 0
+
+        for data_path in data_paths:
+            with open(data_path, 'r', encoding='utf-8') as f:
+                merged_text += f.read() + "\n"
+            current_step += 1
+            if progress_callback:
+                progress_callback(int(current_step / total_steps * 100))
+        
+        cleaned_text = clean_text(merged_text, custom_pattern)
+        current_step += 1
+        if progress_callback:
+            progress_callback(int(current_step / total_steps * 100))
+        
+        tokens = tokenize_text(cleaned_text, model_dir)
+        current_step += 1
+        if progress_callback:
+            progress_callback(int(current_step / total_steps * 100))
+        
+        if len(tokens) == 0:
+            raise ValueError("토큰화된 텍스트가 없습니다. 입력 데이터를 확인하세요.")
+        
+        vocab = create_vocab(tokens)
+        vocab_path = ensure_unique_filename(output_dir, 'vocab.json')
+        with open(vocab_path, 'w', encoding='utf-8') as f:
+            json.dump(vocab, f, ensure_ascii=False, indent=4)
+
+        qa_pairs = create_qa_pairs(tokens, max_pairs=max_pairs, template=template)
+        if len(qa_pairs) == 0:
+            raise ValueError("생성된 질문-답변 쌍이 없습니다. 입력 데이터를 확인하세요.")
+        
+        dpo_pairs = create_dpo_pairs(tokens)
+        
+        train_pairs, valid_pairs = train_test_split(qa_pairs, test_size=test_size, random_state=42)
+
+        train_data = [pair for pair in train_pairs]
+        valid_data = [pair for pair in valid_pairs]
+
+        train_path = ensure_unique_filename(output_dir, 'train.json')
+        valid_path = ensure_unique_filename(output_dir, 'valid.json')
+        dpo_path = ensure_unique_filename(output_dir, 'dpo.json')
+
+        with open(train_path, 'w', encoding='utf-8') as f:
+            json.dump(train_data, f, ensure_ascii=False, indent=4)
+        
+        with open(valid_path, 'w', encoding='utf-8') as f:
+            json.dump(valid_data, f, ensure_ascii=False, indent=4)
+        
+        with open(dpo_path, 'w', encoding='utf-8') as f:
+            json.dump(dpo_pairs, f, ensure_ascii=False, indent=4)
+
+        current_step += 1
+        if progress_callback:
+            progress_callback(int(current_step / total_steps * 100))
+
+        print("데이터셋 생성 완료: train.json, valid.json, dpo.json")
+
+    except Exception as e:
+        logging.error("Error in process_data", exc_info=True)
+        raise e
+
+class DataProcessingTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.settings = load_settings()
+        self.initUI()
+        
+    def initUI(self):
+        layout = QVBoxLayout()
+        
+        self.dataDirLabel = QLabel('데이터 디렉토리 또는 파일:')
+        self.dataDirInput = QLineEdit(self)
+        if 'dataDir' in self.settings:
+            self.dataDirInput.setText(self.settings['dataDir'])
+        self.dataDirButton = QPushButton('Browse', self)
+        self.dataDirButton.clicked.connect(self.browse_data_dir_or_file)
+        
+        self.outputDirLabel = QLabel('출력 디렉토리 (기본: 바탕화면):')
+        self.outputDirInput = QLineEdit(self)
+        if 'outputDir' in self.settings:
+            self.outputDirInput.setText(self.settings['outputDir'])
+        else:
+            self.outputDirInput.setText(os.path.join(os.path.expanduser("~"), "Desktop"))
+        self.outputDirButton = QPushButton('Browse', self)
+        self.outputDirButton.clicked.connect(self.browse_output_dir)
+        
+        self.modelDirLabel = QLabel('모델 디렉토리:')
+        self.modelDirInput = QLineEdit(self)
+        if 'modelDir' in self.settings:
+            self.modelDirInput.setText(self.settings['modelDir'])
+        self.modelDirButton = QPushButton('Browse', self)
+        self.modelDirButton.clicked.connect(self.browse_model_dir)
+
+        self.properNounLabel = QLabel('고유명사 사전 파일:')
+        self.properNounInput = QLineEdit(self)
+        if 'properNounFile' in self.settings:
+            self.properNounInput.setText(self.settings['properNounFile'])
+        self.properNounButton = QPushButton('Browse', self)
+        self.properNounButton.clicked.connect(self.browse_proper_noun_file)
+        self.properNounLoadButton = QPushButton('Load', self)
+        self.properNounLoadButton.clicked.connect(self.load_proper_noun_file)
+
+        self.analyzeProperNounButton = QPushButton('고유명사 분석', self)
+        self.analyzeProperNounButton.clicked.connect(self.analyze_proper_nouns)
+
+        self.templateLabel = QLabel('JSON 템플릿 파일 (선택):')
+        self.templateInput = QLineEdit(self)
+        if 'templateFile' in self.settings:
+            self.templateInput.setText(self.settings['templateFile'])
+        self.templateButton = QPushButton('Browse', self)
+        self.templateButton.clicked.connect(self.browse_template_file)
+
+        self.customPatternLabel = QLabel('커스텀 정규식 패턴:')
+        customPatternLayout = QHBoxLayout()
+        self.customPatternInput = QLineEdit(self)
+        if 'customPattern' in self.settings:
+            self.customPatternInput.setText(self.settings['customPattern'])
+        self.helpButton = QPushButton('?', self)
+        self.helpButton.setFixedSize(20, 20)
+        self.helpButton.clicked.connect(self.show_help)
+        customPatternLayout.addWidget(self.customPatternInput)
+        customPatternLayout.addWidget(self.helpButton)
+
+        self.batchSizeLabel = QLabel('배치 크기 (기본값: 32):')
+        self.batchSizeInput = QLineEdit(self)
+        self.batchSizeInput.setText("32")
+        if 'batchSize' in self.settings:
+            self.batchSizeInput.setText(str(self.settings['batchSize']))
+
+        self.maxPairsLabel = QLabel('최대 질문-답변 쌍 수 (기본값: 100):')
+        self.maxPairsInput = QLineEdit(self)
+        self.maxPairsInput.setText("100")
+        if 'maxPairs' in self.settings:
+            self.maxPairsInput.setText(str(self.settings['maxPairs']))
+
+        self.processButton = QPushButton('전처리 실행', self)
+        self.processButton.clicked.connect(self.process_data)
+
+        self.progressBar = QProgressBar(self)
+        self.progressBar.setValue(0)
+        self.progressBar.setAlignment(Qt.AlignCenter)
+        
+        layout.addWidget(self.dataDirLabel)
+        layout.addWidget(self.dataDirInput)
+        layout.addWidget(self.dataDirButton)
+        layout.addWidget(self.outputDirLabel)
+        layout.addWidget(self.outputDirInput)
+        layout.addWidget(self.outputDirButton)
+        layout.addWidget(self.modelDirLabel)
+        layout.addWidget(self.modelDirInput)
+        layout.addWidget(self.modelDirButton)
+        layout.addWidget(self.properNounLabel)
+        layout.addWidget(self.properNounInput)
+        layout.addWidget(self.properNounButton)
+        layout.addWidget(self.properNounLoadButton)
+        layout.addWidget(self.analyzeProperNounButton)
+        layout.addWidget(self.templateLabel)
+        layout.addWidget(self.templateInput)
+        layout.addWidget(self.templateButton)
+        layout.addWidget(self.customPatternLabel)
+        layout.addLayout(customPatternLayout)
+        layout.addWidget(self.batchSizeLabel)
+        layout.addWidget(self.batchSizeInput)
+        layout.addWidget(self.maxPairsLabel)
+        layout.addWidget(self.maxPairsInput)
+        layout.addWidget(self.processButton)
+        layout.addWidget(self.progressBar)
+        
+        self.setLayout(layout)
+
+    def browse_data_dir_or_file(self):
+        file_dialog = QFileDialog()
+        file_dialog.setFileMode(QFileDialog.ExistingFiles)
+        if file_dialog.exec_():
+            files = file_dialog.selectedFiles()
+            self.dataDirInput.setText(';'.join(files))
+            self.settings['dataDir'] = ';'.join(files)
+            save_settings(self.settings)
+    
+    def browse_output_dir(self):
+        dir = QFileDialog.getExistingDirectory(self, '출력 디렉토리 선택')
+        if dir:
+            self.outputDirInput.setText(dir)
+            self.settings['outputDir'] = dir
+            save_settings(self.settings)
+
+    def browse_model_dir(self):
+        dir = QFileDialog.getExistingDirectory(self, '모델 디렉토리 선택')
+        if dir:
+            self.modelDirInput.setText(dir)
+            self.settings['modelDir'] = dir
+            save_settings(self.settings)
+
+    def browse_proper_noun_file(self):
+        file_dialog = QFileDialog()
+        file_dialog.setFileMode(QFileDialog.ExistingFile)
+        if file_dialog.exec_():
+            file = file_dialog.selectedFiles()[0]
+            self.properNounInput.setText(file)
+            self.settings['properNounFile'] = file
+            save_settings(self.settings)
+    
+    def load_proper_noun_file(self):
+        proper_noun_file = self.properNounInput.text()
+        if proper_noun_file:
+            load_proper_nouns(proper_noun_file)
+        else:
+            QMessageBox.warning(self, 'Error', '고유명사 사전 파일을 선택해주세요.')
+
+    def analyze_proper_nouns(self):
+        data_paths = self.dataDirInput.text().split(';')
+        model_dir = self.modelDirInput.text()
+        if not data_paths or not model_dir:
+            QMessageBox.warning(self, 'Error', '데이터 파일과 모델 디렉토리를 선택해주세요.')
+            return
+        try:
+            texts = []
+            for data_path in data_paths:
+                with open(data_path, 'r', encoding='utf-8') as f:
+                    texts.append(f.read())
+            proper_nouns = extract_proper_nouns(texts)
+            PROPER_NOUNS.update(proper_nouns)
+            QMessageBox.information(self, 'Success', '고유명사 분석이 완료되었습니다.')
+        except Exception as e:
+            QMessageBox.critical(self, 'Error', f'고유명사 분석 중 오류가 발생했습니다: {str(e)}')
+
+    def browse_template_file(self):
+        file_dialog = QFileDialog()
+        file_dialog.setFileMode(QFileDialog.ExistingFile)
+        if file_dialog.exec_():
+            file = file_dialog.selectedFiles()[0]
+            self.templateInput.setText(file)
+            self.settings['templateFile'] = file
+            save_settings(self.settings)
+
+    def process_data(self):
+        data_paths = self.dataDirInput.text().split(';')
+        output_dir = self.outputDirInput.text()
+        model_dir = self.modelDirInput.text()
+        custom_pattern = self.customPatternInput.text()
+        batch_size = self.batchSizeInput.text()
+        max_pairs = self.maxPairsInput.text()
+        template_path = self.templateInput.text()
+        
+        if not data_paths or not output_dir or not model_dir or not batch_size or not max_pairs:
+            QMessageBox.warning(self, 'Error', '모든 필드를 채워주세요.')
+            return
+        
+        try:
+            batch_size = int(batch_size)
+            max_pairs = int(max_pairs)
+        except ValueError:
+            QMessageBox.warning(self, 'Error', '배치 크기와 최대 질문-답변 쌍 수는 정수여야 합니다.')
+            return
+        
+        self.settings['customPattern'] = custom_pattern
+        self.settings['batchSize'] = batch_size
+        self.settings['maxPairs'] = max_pairs
+        self.settings['templateFile'] = template_path
+        save_settings(self.settings)
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        def update_progress(value):
+            self.progressBar.setValue(value)
+        
+        try:
+            if template_path:
+                process_data(data_paths, output_dir, batch_size, model_dir, custom_pattern, max_pairs=max_pairs, progress_callback=update_progress, template_path=template_path)
+            else:
+                process_data(data_paths, output_dir, batch_size, model_dir, custom_pattern, max_pairs=max_pairs, progress_callback=update_progress)
+            QMessageBox.information(self, 'Success', '데이터 전처리가 완료되었습니다.')
+            self.progressBar.setValue(0)  # 진행 상황 초기화
+        except Exception as e:
+            QMessageBox.critical(self, 'Error', f'데이터 전처리 중 오류가 발생했습니다: {str(e)}')
+            self.progressBar.setValue(0)  # 진행 상황 초기화
+
+    def show_help(self):
+        help_text = """
+        커스텀 정규식 패턴:
+        
+        정규식(Regular Expression)을 사용하여 텍스트에서 특정 패턴을 찾아 제거하거나 치환할 수 있습니다.
+        다음은 일반적으로 사용되는 정규식 패턴의 예시입니다:
+
+        - \\d: 모든 숫자를 의미합니다.
+        - \\s: 모든 공백 문자를 의미합니다.
+        - [a-zA-Z]: 모든 영문 대소문자를 의미합니다.
+        - [^ㄱ-ㅎ가-힣]: 모든 한글 문자 외의 문자를 의미합니다.
+        - https?://\\S+: URL을 의미합니다.
+
+        예를 들어, 텍스트에서 모든 숫자와 URL을 제거하려면 `\\d|https?://\\S+`를 커스텀 정규식 패턴으로 사용하십시오.
+        """
+
+        QMessageBox.information(self, '도움말', help_text)
+
+class App(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.title = '데이터 전처리 및 모델 설정 GUI'
+        self.settings = load_settings()
+        self.initUI()
+        
+    def initUI(self):
+        self.setWindowTitle(self.title)
+        
+        self.tabWidget = QTabWidget()
+        
+        self.dataProcessingTab = DataProcessingTab()
+        
+        self.tabWidget.addTab(self.dataProcessingTab, "데이터 전처리")
+        
+        layout = QVBoxLayout()
+        layout.addWidget(self.tabWidget)
+        
+        self.setLayout(layout)
+        
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    ex = App()
+    ex.show()
+    sys.exit(app.exec_())
